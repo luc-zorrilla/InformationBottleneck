@@ -252,6 +252,13 @@ def four_well_force(
         u - 0.5 * (a**2 + b**2)
     )
 
+def four_well_potential(x: np.ndarray, params: dict) -> np.ndarray:
+    """Potential corresponding to four_well_force."""
+    A = params["A"]
+    a = params["a"]
+    b = params["b"]
+    return A * (x**2 - a**2)**2 * (x**2 - b**2)**2
+
 
 if __name__ == "__main__":
     ou_params = {

@@ -186,9 +186,10 @@ def predictive_information_bottleneck(
     Minimizes:
         I(H; X) - beta * I(H; Y)
 
-    where X is the current binned state and Y is the next binned state.
-    The supplied transition matrix defines p(y|x), and `stationary` defines
-    p(x).
+    where :
+        - X is the current binned state
+        - Y is the next binned state.
+    The supplied transition matrix defines p(y|x), and `stationary` defines p(x).
 
     Returns
     -------
