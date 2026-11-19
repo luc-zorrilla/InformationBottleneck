@@ -30,6 +30,8 @@ def simulate_langevin(
     noise_increment: NoiseIncrement,
     params: dict[str, Any] | None = None,
     seed: int | None = None,
+    n_repeats: int = 1,
+    periodic_bounds: tuple[float, float] | None = None,    
 ) -> tuple[np.ndarray, np.ndarray]:
     """Simulate trajectories with the Euler–Maruyama method.
 
@@ -54,14 +56,33 @@ def simulate_langevin(
         raise ValueError("dt must be positive.")
     if n_steps < 0:
         raise ValueError("n_steps must be non-negative.")
+    if not isinstance(n_repeats, int) or n_repeats < 1:
+        raise ValueError("n_repeats must be a positive integer.")        
 
     params = {} if params is None else params
     rng = np.random.default_rng(seed)
 
     initial = np.asarray(initial_positions, dtype=float)
+
     # Treat a single state as a batch containing one trajectory.
     if initial.ndim == 0:
-        initial = initial.reshape(1)
+        initial = np.full((n_repeats, 1), float(initial))
+    elif initial.ndim == 2 and initial.shape[0] == 1:
+        initial = np.repeat(initial, n_repeats, axis=0)
+    elif n_repeats != 1:
+        raise ValueError(
+            "With n_repeats > 1, provide one scalar position or "
+            "one vector position shaped (1, dimension)."
+        )
+    elif initial.ndim == 1:
+        initial = initial[:, None]        
+
+    if periodic_bounds is not None:
+        lower, upper = periodic_bounds
+        if not lower < upper:
+            raise ValueError("periodic_bounds must satisfy lower < upper.")
+        width = upper - lower
+        initial = lower + np.mod(initial - lower, width)
 
     times = np.arange(n_steps + 1) * dt
     trajectories = np.empty((n_steps + 1,) + initial.shape, dtype=float)
@@ -81,7 +102,11 @@ def simulate_langevin(
                 "the same shape as the state."
             )
 
-        trajectories[i + 1] = x + drift * dt + random_step
+        next_x = x + drift * dt + random_step
+        if periodic_bounds is not None:
+            next_x = lower + np.mod(next_x - lower, width)            
+
+        trajectories[i + 1] = next_x
 
     return times, trajectories
 
@@ -288,6 +313,7 @@ if __name__ == "__main__":
         noise_increment=brownian_noise,
         params=four_well_params,
         seed=42,
+        periodic_bounds=(-1.0, 1.0),
     )
 
     plot_potential_from_force(

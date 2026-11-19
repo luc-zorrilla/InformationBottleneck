@@ -1,10 +1,5 @@
 """
 Simulate Dynamical Systems (DS) and use Information Bottleneck (IB) to reduce dimensionality
-Also requires the earlier functions:
-    simulate_langevin
-    brownian_noise
-    ulam_approximation
-    predictive_information_bottleneck
 """
 
 import numpy as np
@@ -12,16 +7,18 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from plotly.colors import sample_colorscale
 
-
 from StochasticDynamics import (
     simulate_langevin,
     four_well_force,
     four_well_potential,
     brownian_noise,
+    plot_trajectories,
+    plot_trajectory_histogram,
 )
 from InformationBottleneck import (
     ulam_approximation,
-    predictive_information_bottleneck,
+    ulam_eigendelements,
+    blahut_arimoto,
     information_quantities,
 )
 
@@ -133,20 +130,25 @@ def plot_results(
 
 def main() -> None:
     base_params = {
-        "A": 5.0,
+        "A": 10,
         "a": 0.5,
         "b": 1.0,
-        "sigma": 0.1,  # Replaced in the loop
     }
 
-    dt = 1e-4
+    n_traj = int(1e1)
+    n_repeats = int(1e1)
+    starts = np.linspace(-1, 1, n_traj)
+    initial_batch = np.repeat(starts, n_repeats)[:, None]
+    periodic_bounds=(-1.0, 1.0)
+    
+    dt = 1e0
     n_steps = 200_000
-    burn_in_steps = 20_000
+    burn_in_steps = n_steps//10
     beta = 1e6
-    n_states_to_test = range(1, 20)
-    sigma_values = np.linspace(0.1, 0.3, 3)
+    n_states_to_test = range(1,10)
+    sigma_values = np.linspace(0.05, 0.4, 8)
 
-    bin_edges = np.linspace(-1.1, 1.1, 65)
+    bin_edges = np.linspace(-1, 1, 1000)
     n_h_values = list(n_states_to_test)
 
     # Store all results, indexed by sigma and then number of reduced states.
@@ -156,28 +158,36 @@ def main() -> None:
         model_params = {**base_params, "sigma": float(sigma)}
 
         times, trajectories = simulate_langevin(
-            initial_positions=np.array([0.0]),
+            initial_positions=initial_batch,
             dt=dt,
             n_steps=n_steps,
             force=four_well_force,
             noise_increment=brownian_noise,
             params=model_params,
             seed=10,
+            periodic_bounds=(-1.0, 1.0),
         )
 
-        x = np.asarray(trajectories).reshape(len(times), -1)[:, 0]
-        x_equilibrated = x[burn_in_steps:]
+        # plot_trajectories(times, trajectories).show()
+        # plot_trajectory_histogram(trajectories).show()
+
+        # Shape: (n_trajectories, n_steps + 1)
+        x_all = trajectories[:, :, 0].T
 
         ulam = ulam_approximation(
-            x_equilibrated,
+            x_all,
             bin_edges,
-            pseudocount=1e-8,
+            burn_in=burn_in_steps,
         )
-
+        
         results_for_sigma = {}
 
+        print(f"Exact IB computation...")
         for n_h in n_h_values:
-            encoder, info = predictive_information_bottleneck(
+
+            print(f"n_h = {n_h}")
+
+            encoder, info = blahut_arimoto(
                 transition=ulam.transition,
                 stationary=ulam.stationary,
                 n_reduced_states=n_h,
@@ -187,7 +197,7 @@ def main() -> None:
 
             p_h = ulam.stationary @ encoder
             positive = p_h > 0
-            h_entropy_nats = -np.sum(
+            h_entropy = -np.sum(
                 p_h[positive] * np.log(p_h[positive])
             )
 
@@ -195,28 +205,46 @@ def main() -> None:
             # One entry per full-state bin: the most likely reduced state for that bin.
             h_of_x = np.argmax(encoder, axis=1)
 
+            # # hard_encoder[x, h] = 1 if h is the most likely state for x, else 0
+            # hard_encoder = np.eye(encoder.shape[1])[h_of_x]
+
+            # hard_info = information_quantities(
+            #     transition=ulam.transition,
+            #     stationary=ulam.stationary,
+            #     encoder=hard_encoder,
+            # )
+
             results_for_sigma[n_h] = {
                 "encoder": encoder,
                 "h_of_x": h_of_x,
                 "p_h": p_h,
-                "I_HX_nats": info["I_HX"],
-                "I_HY_nats": info["I_HY"],
-                "H_H_nats": h_entropy_nats,
+                "I_HX": info["I_HX"],
+                "I_HY": info["I_HY"],
+                "H_H": h_entropy,
                 "objective": info["objective"],
                 "transition": ulam.transition,
                 "stationary": ulam.stationary,
             }
 
+            # results_for_sigma[n_h] = { # TODO: check whether it works and come back to continuous encoder otherwise
+            #     "encoder": hard_encoder,
+            #     "h_of_x": h_of_x,
+            #     "p_h": p_h,
+            #     "I_HX": hard_info["I_HX"],
+            #     "I_HY": hard_info["I_HY"],
+            #     "H_H": h_entropy,
+            #     "objective": info["objective"],
+            #     "transition": ulam.transition,
+            #     "stationary": ulam.stationary,
+            # }
+
+
+        print(f"Done.")
+
         results_by_sigma[float(sigma)] = results_for_sigma
 
-        print(
-            f"Finished sigma={sigma:.3f}; "
-            f"I(H;X_next) at n_H=6: "
-            f"{results_for_sigma[6]['I_HY_nats'] / np.log(2):.4f} bits"
-        )
-
     # Potential does not depend on sigma.
-    x_plot = np.linspace(-1.1, 1.1, 1000)
+    x_plot = bin_edges
     v_plot = four_well_potential(x_plot, base_params)
 
     fig = make_subplots(
@@ -252,12 +280,12 @@ def main() -> None:
         color_position = (sigma - sigma_min) / (sigma_max - sigma_min)
         color = sample_colorscale(colorscale, [color_position])[0]
 
-        i_hy_bits = [
-            results[n_h]["I_HY_nats"] / np.log(2)
+        i_hy = [
+            results[n_h]["I_HY"]
             for n_h in n_h_values
         ]
-        i_hx_bits = [
-            results[n_h]["I_HX_nats"] / np.log(2)
+        i_hx = [
+            results[n_h]["I_HX"]
             for n_h in n_h_values
         ]
 
@@ -268,7 +296,7 @@ def main() -> None:
         fig.add_trace(
             go.Scatter(
                 x=n_h_values,
-                y=i_hy_bits,
+                y=i_hy,
                 mode="lines",
                 line=dict(color=color, width=1.5),
                 showlegend=False,
@@ -285,7 +313,7 @@ def main() -> None:
         fig.add_trace(
             go.Scatter(
                 x=n_h_values,
-                y=i_hx_bits,
+                y=i_hx,
                 mode="lines",
                 line=dict(color=color, width=1.5),
                 showlegend=False,

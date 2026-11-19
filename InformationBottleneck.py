@@ -18,6 +18,7 @@ import unittest
 from typing import NamedTuple
 
 import numpy as np
+from scipy.linalg import eig
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -34,33 +35,105 @@ class UlamEigenResult(NamedTuple):
     left_eigenvalues: np.ndarray
     left_eigenvectors: np.ndarray   # columns u: P.T @ u = lambda * u
 
+def empirical_stationary_distribution(
+    trajectory: np.ndarray,
+    bins=100,
+    *,
+    burn_in: int = 0,
+    value_range=None,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Estimate stationary bin probabilities from post-burn-in samples.
+
+    The first axis is time. Any remaining axes before the final coordinate
+    axis are treated as independent samples (for example, repeats). For a
+    scalar system, pass data shaped (time,) or (time, repeats).
+
+    Returns
+    -------
+    probabilities:
+        Probability mass in each bin; sums to 1.
+    bin_edges:
+        One array of bin edges per coordinate.
+    """
+    data = np.asarray(trajectory, dtype=float)
+
+    if data.ndim == 0 or data.shape[0] == 0:
+        raise ValueError("trajectory must have a non-empty time axis.")
+    if not np.all(np.isfinite(data)):
+        raise ValueError("trajectory must contain only finite values.")
+    if not isinstance(burn_in, (int, np.integer)) or burn_in < 0:
+        raise ValueError("burn_in must be a nonnegative integer.")
+    if burn_in >= data.shape[0]:
+        raise ValueError("burn_in must be smaller than the number of time steps.")
+
+    samples = data[burn_in:]
+
+    # A scalar trajectory has one coordinate per sample.
+    if samples.ndim == 1:
+        points = samples.reshape(-1, 1)
+    # A 1D system with repeats may be shaped (time, repeats).
+    elif samples.ndim == 2:
+        points = samples.reshape(-1, 1)
+    else:
+        # Last axis stores coordinates; preceding axes store samples/repeats.
+        points = samples.reshape(-1, samples.shape[-1])
+
+    if points.shape[0] == 0:
+        raise ValueError("No samples remain after burn-in.")
+
+    counts, bin_edges = np.histogramdd(
+        points,
+        bins=bins,
+        range=value_range,
+    )
+    total = counts.sum()
+    if total == 0:
+        raise ValueError("No samples fell within the requested histogram range.")
+
+    return counts / total, bin_edges
+
+def stationary_distribution(
+    transition: np.ndarray,
+    *,
+    tolerance: float = 1e-12,
+    max_iterations: int = 100_000,
+) -> np.ndarray:
+    """Estimate a stationary distribution pi satisfying pi @ P = pi."""
+    transition = np.asarray(transition, dtype=float)
+
+    if transition.ndim != 2 or transition.shape[0] != transition.shape[1]:
+        raise ValueError("transition must be a square matrix.")
+    if np.any(transition < 0) or not np.all(np.isfinite(transition)):
+        raise ValueError("transition entries must be finite and nonnegative.")
+    if not np.allclose(transition.sum(axis=1), 1.0, atol=1e-10):
+        raise ValueError("Each transition-matrix row must sum to 1.")
+
+    n_states = transition.shape[0]
+    distribution = np.full(n_states, 1.0 / n_states)
+
+    for _ in range(max_iterations):
+        updated = distribution @ transition
+        residual = np.linalg.norm(updated - distribution, ord=1)
+
+        if residual < tolerance:
+            return updated / updated.sum()
+
+        distribution = updated
+
+    raise RuntimeError(
+        f"Stationary-distribution iteration did not converge; "
+        f"last residual = {residual:.3e} < {tolerance} = tolerance"
+    )
+
 def ulam_approximation(
     trajectories: np.ndarray,
     bin_edges: np.ndarray,
     *,
-    pseudocount: float = 0.0,
+    burn_in: int = 0,
 ) -> UlamResult:
-    """Estimate a discrete transfer operator from trajectory samples.
+    """Estimate a Ulam transition matrix and empirical stationary occupancy.
 
-    Parameters
-    ----------
-    trajectories:
-        Array shaped (n_trajectories, n_times), or a 1D time series.
-        Each consecutive pair contributes one transition.
-    bin_edges:
-        Strictly increasing bin boundaries. Values outside the boundaries
-        are ignored. Bins are [edge_i, edge_{i+1}), except the final bin,
-        which includes its right edge.
-    pseudocount:
-        Nonnegative count added to every transition cell. Use a small
-        positive value to avoid zero-probability transitions.
-
-    Returns
-    -------
-    UlamResult:
-        `transition[i, j]` is the estimated probability of transitioning
-        from source bin i to target bin j. `stationary` is estimated by
-        power iteration on that matrix.
+    `stationary` is the normalized histogram of post-burn-in samples.
     """
     trajectories = np.asarray(trajectories, dtype=float)
     bin_edges = np.asarray(bin_edges, dtype=float)
@@ -69,26 +142,35 @@ def ulam_approximation(
         trajectories = trajectories[None, :]
     if trajectories.ndim != 2:
         raise ValueError("trajectories must be 1D or 2D.")
+    if trajectories.shape[1] == 0:
+        raise ValueError("trajectories must contain at least one time step.")
+    if not np.all(np.isfinite(trajectories)):
+        raise ValueError("trajectories must contain only finite values.")
     if bin_edges.ndim != 1 or len(bin_edges) < 2:
         raise ValueError("bin_edges must be a 1D array with at least two edges.")
-    if not np.all(np.diff(bin_edges) > 0):
-        raise ValueError("bin_edges must be strictly increasing.")
-    if pseudocount < 0:
-        raise ValueError("pseudocount must be nonnegative.")
+    if not np.all(np.isfinite(bin_edges)) or not np.all(np.diff(bin_edges) > 0):
+        raise ValueError("bin_edges must be finite and strictly increasing.")
+    if not isinstance(burn_in, (int, np.integer)) or burn_in < 0:
+        raise ValueError("burn_in must be a nonnegative integer.")
+    if burn_in >= trajectories.shape[1]:
+        raise ValueError("burn_in must be smaller than the number of time steps.")
 
     n_bins = len(bin_edges) - 1
-    counts = np.full((n_bins, n_bins), pseudocount, dtype=float)
+    counts = np.zeros((n_bins, n_bins), dtype=float)
 
+    # Estimate transitions using only pairs whose source and target are
+    # both in the post-burn-in portion of each trajectory.
     for trajectory in trajectories:
-        if len(trajectory) < 2:
+        post_burn = trajectory[burn_in:]
+        if len(post_burn) < 2:
             continue
 
-        source = np.searchsorted(bin_edges, trajectory[:-1], side="right") - 1
-        target = np.searchsorted(bin_edges, trajectory[1:], side="right") - 1
+        source = np.searchsorted(bin_edges, post_burn[:-1], side="right") - 1
+        target = np.searchsorted(bin_edges, post_burn[1:], side="right") - 1
 
         # Include values exactly equal to the final edge in the last bin.
-        source[trajectory[:-1] == bin_edges[-1]] = n_bins - 1
-        target[trajectory[1:] == bin_edges[-1]] = n_bins - 1
+        source[post_burn[:-1] == bin_edges[-1]] = n_bins - 1
+        target[post_burn[1:] == bin_edges[-1]] = n_bins - 1
 
         valid = (
             (source >= 0) & (source < n_bins)
@@ -99,15 +181,27 @@ def ulam_approximation(
     row_sums = counts.sum(axis=1)
     transition = np.zeros_like(counts)
     observed_rows = row_sums > 0
-    transition[observed_rows] = counts[observed_rows] / row_sums[observed_rows, None]
+    transition[observed_rows] = (
+        counts[observed_rows] / row_sums[observed_rows, None]
+    )
 
-    # For unobserved bins, use a self-transition. This keeps P row-stochastic
-    # without inventing transitions to other bins.
+    # Keep unobserved rows stochastic without inventing outgoing transitions.
     unobserved = ~observed_rows
     transition[unobserved, unobserved] = 1.0
 
-    stationary = stationary_distribution(transition)
+    # Empirical occupancy from all post-burn-in samples, pooled across runs.
+    samples = trajectories[:, burn_in:].ravel()
+    in_range = (samples >= bin_edges[0]) & (samples <= bin_edges[-1])
+    samples = samples[in_range]
+
+    if samples.size == 0:
+        raise ValueError("No post-burn-in samples fall within the bin range.")
+
+    occupancy, _ = np.histogram(samples, bins=bin_edges)
+    stationary = occupancy.astype(float) / occupancy.sum()
+
     return UlamResult(transition=transition, stationary=stationary)
+
 
 def ulam_eigendelements(result: UlamResult) -> UlamEigenResult:
     """Compute right and left eigensystems of an Ulam transition matrix."""
@@ -135,43 +229,74 @@ def ulam_eigendelements(result: UlamResult) -> UlamEigenResult:
         left_eigenvectors=left_vectors,
     )
 
-def stationary_distribution(
-    transition: np.ndarray,
-    *,
-    tolerance: float = 1e-12,
-    max_iterations: int = 100_000,
-) -> np.ndarray:
-    """Estimate a stationary distribution pi satisfying pi @ P = pi."""
-    transition = np.asarray(transition, dtype=float)
-
-    if transition.ndim != 2 or transition.shape[0] != transition.shape[1]:
-        raise ValueError("transition must be a square matrix.")
-    if np.any(transition < 0) or not np.all(np.isfinite(transition)):
-        raise ValueError("transition entries must be finite and nonnegative.")
-    if not np.allclose(transition.sum(axis=1), 1.0, atol=1e-10):
-        raise ValueError("Each transition-matrix row must sum to 1.")
-
-    n_states = transition.shape[0]
-    distribution = np.full(n_states, 1.0 / n_states)
-
-    for _ in range(max_iterations):
-        updated = distribution @ transition
-        if np.linalg.norm(updated - distribution, ord=1) < tolerance:
-            return updated / updated.sum()
-        distribution = updated
-
-    raise RuntimeError("Stationary-distribution iteration did not converge.")
-
-
 def _normalize_probabilities(values: np.ndarray, axis: int) -> np.ndarray:
     """Normalize nonnegative values along an axis."""
-    totals = values.sum(axis=axis, keepdims=True)
+    values = np.asarray(values, dtype=float)
+
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Probabilities must be finite.")
+    if np.any(values < 0):
+        raise ValueError("Probabilities must be nonnegative.")
+
+    # Scaling preserves the normalized result and reduces overflow risk.
+    scaled = values / np.max(values, axis=axis, keepdims=True)
+    totals = scaled.sum(axis=axis, keepdims=True)
+
     if np.any(totals <= 0):
         raise ValueError("Cannot normalize a zero-mass distribution.")
-    return values / totals
 
+    return scaled / totals
 
-def predictive_information_bottleneck(
+def mutual_information(joint: np.ndarray) -> float:
+    """MI for a joint distribution indexed as joint[a, b]."""
+    # I(A;B) = sum_a,b p(a,b) log[p(a,b)/(p(a)p(b))]
+
+    p_a = joint.sum(axis=1, keepdims=True)
+    p_b = joint.sum(axis=0, keepdims=True)
+    denominator = p_a * p_b
+    mask = (joint > 0) & (denominator > 0)
+    return float(
+        np.sum(joint[mask] * np.log(joint[mask] / denominator[mask]))
+    )/ np.log(2)
+
+def information_quantities(
+    transition: np.ndarray,
+    stationary: np.ndarray,
+    encoder: np.ndarray,
+) -> dict[str, float]:
+    """Compute I(H;X) and I(H;X_next) in nats or bits.
+
+    Use base=np.e for nats and base=2 for bits.
+    """
+    transition = np.asarray(transition, dtype=float)
+    stationary = np.asarray(stationary, dtype=float)
+    encoder = np.asarray(encoder, dtype=float)
+
+    n_x = stationary.size
+    if transition.shape != (n_x, n_x):
+        raise ValueError("transition must have shape (n_states, n_states)")
+    if encoder.ndim != 2 or encoder.shape[0] != n_x:
+        raise ValueError("encoder must have shape (n_states, n_reduced_states)")
+    if np.any(stationary < 0) or np.any(transition < 0) or np.any(encoder < 0):
+        raise ValueError("Probabilities must be non-negative")
+    if not np.isclose(stationary.sum(), 1.0):
+        raise ValueError("stationary must sum to 1")
+    if not np.allclose(transition.sum(axis=1), 1.0):
+        raise ValueError("Each transition-matrix row must sum to 1")
+    if not np.allclose(encoder.sum(axis=1), 1.0):
+        raise ValueError("Each encoder row must sum to 1")
+
+    # p(h, x) = p(x) p(h|x)
+    p_hx = stationary[:, None] * encoder
+    i_hx = mutual_information(p_hx.T)  # rows=h, columns=x
+
+    # p(h, y) = sum_x p(x) p(h|x) P(x_next|x)
+    p_hy = (stationary[:, None] * encoder).T @ transition
+    i_hy = mutual_information(p_hy)
+
+    return {"I_HX": i_hx, "I_HY": i_hy}
+
+def blahut_arimoto(
     transition: np.ndarray,
     stationary: np.ndarray,
     n_reduced_states: int,
@@ -181,7 +306,8 @@ def predictive_information_bottleneck(
     max_iterations: int = 10_000,
     seed: int | None = 0,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Optimize the encoder q(h|x) for the predictive Information Bottleneck.
+    """Optimize the encoder q(h|x) for the predictive Information Bottleneck, 
+    using the Blahut-Arimoto algorithm.
 
     Minimizes:
         I(H; X) - beta * I(H; Y)
@@ -197,7 +323,7 @@ def predictive_information_bottleneck(
         Array shaped (n_full_states, n_reduced_states), with each row
         representing q(h|x).
     information:
-        Dictionary containing I(H;X), I(H;Y), and the objective in nats.
+        Dictionary containing I(H;X), I(H;Y), and the objective in bits.
     """
     transition = np.asarray(transition, dtype=float)
     stationary = np.asarray(stationary, dtype=float)
@@ -219,47 +345,69 @@ def predictive_information_bottleneck(
         raise ValueError("stationary must sum to 1.")
 
     # Remove zero-occupancy states; they do not affect either mutual information.
+    # TODO: check if necessary
     active = stationary > 0
-    px = stationary[active]
-    p_y_given_x = transition[active]
-    px = px / px.sum()
+    p_x = stationary[active]
+    p_x = p_x / p_x.sum()
 
+    p_y_given_x = transition[active].copy()
+    row_sums = p_y_given_x.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 0):
+        raise ValueError("Every active transition row must have positive mass.")
+    p_y_given_x /= row_sums
+
+    # Initialize encoder randomly
     rng = np.random.default_rng(seed)
-    encoder = rng.random((len(px), n_reduced_states)) + 1e-3
+    encoder = rng.random((len(p_x), n_reduced_states)) + 1e-3
     encoder = _normalize_probabilities(encoder, axis=1)
 
+    # Initialize marginal and conditional distributions as well
     eps = np.finfo(float).tiny
+    p_h = p_x @ encoder # p(h) = sum_x p(x) p(h|x)
+    p_y_given_h = ( # p(y|h) = sum_x p(y|x) p(x|h) = sum_x p(x) p(h|x) p(y|x) / p(h) (Bayes formula)
+        (p_x[:, None] * encoder).T @ p_y_given_x
+    ) / np.maximum(p_h[:, None], eps) 
 
     for _ in range(max_iterations):
-        # q(h) = sum_x p(x) q(h|x)
-        p_h = px @ encoder
+        
+        # 1. New encoder
 
-        # p(y|h) = sum_x p(x) q(h|x) p(y|x) / p(h)
-        p_y_given_h = (
-            (px[:, None] * encoder).T @ p_y_given_x
-        ) / np.maximum(p_h[:, None], eps)
-
-        # KL[p(y|x) || p(y|h)], for every x and h.
+        # KL[p(y|x) || p(y|h)] = sum_x p(y|x) log [p(y|x) / p(y|h)], for every x and h.
         log_p_y_given_x = np.log(np.maximum(p_y_given_x, eps))
         log_p_y_given_h = np.log(np.maximum(p_y_given_h, eps))
         kl = np.sum(
             p_y_given_x[:, None, :]
-            * (log_p_y_given_x[:, None, :] - log_p_y_given_h[None, :, :]),
-            axis=2,
+            * (log_p_y_given_x[:, None, :] - log_p_y_given_h[None, :, :]), 
+            axis=2, # TODO: check if axis 2 is correct
         )
 
-        # BA update: q(h|x) proportional to q(h) exp(-beta * KL).
+        # BA update in log space:
+        # p(h|x) ∝ p(h) * exp(-beta * KL[p(y|x) || p(y|h)])
         log_weights = np.log(np.maximum(p_h, eps))[None, :] - beta * kl
-        log_weights -= np.max(log_weights, axis=1, keepdims=True)
-        updated = np.exp(log_weights)
-        updated = _normalize_probabilities(updated, axis=1)
+        log_weights -= np.max(log_weights, axis=1, keepdims=True) # Stabilize each row before exponentiating.
 
-        if np.max(np.abs(updated - encoder)) < tolerance:
-            encoder = updated
+        updated = _normalize_probabilities(np.exp(log_weights), axis=1)
+
+        # Check convergence before replacing the current encoder.
+        change = np.max(np.abs(updated - encoder))
+        encoder = updated    
+
+        # 2. Update marginal distribution
+
+        # p(h) = sum_x p(x) p(h|x)
+        p_h = p_x @ encoder 
+
+        # 3. Update conditional distribution
+
+        # p(y|h) = sum_x p(y|x) p(x|h) = sum_x p(x) p(h|x) p(y|x) / p(h) (Bayes formula)
+        p_y_given_h = (
+            (p_x[:, None] * encoder).T @ p_y_given_x
+        ) / np.maximum(p_h[:, None], eps)
+
+        if change < tolerance:
             break
-        encoder = updated
 
-    # Reinsert any zero-occupancy states as arbitrary normalized rows.
+    # Reinsert any zero-occupancy states as arbitrary normalized rows. # TODO: check if it makes sense
     full_encoder = np.full((n_states, n_reduced_states), 1.0 / n_reduced_states)
     full_encoder[active] = encoder
 
@@ -271,42 +419,7 @@ def predictive_information_bottleneck(
     )
     return full_encoder, information
 
-
-def information_quantities(
-    transition: np.ndarray,
-    stationary: np.ndarray,
-    encoder: np.ndarray,
-) -> dict[str, float]:
-    """Compute I(H;X) and I(H;Y) in nats for an encoder q(h|x)."""
-    transition = np.asarray(transition, dtype=float)
-    stationary = np.asarray(stationary, dtype=float)
-    encoder = np.asarray(encoder, dtype=float)
-
-    px_h = stationary[:, None] * encoder
-    p_h = px_h.sum(axis=0)
-    p_y = stationary @ transition
-    p_hy = px_h.T @ transition
-
-    eps = np.finfo(float).tiny
-
-    # I(H;X) = sum_x,h p(x,h) log[p(h|x)/p(h)]
-    ix_terms = np.zeros_like(px_h)
-    valid_xh = px_h > 0
-    ix_terms[valid_xh] = px_h[valid_xh] * np.log(
-        (encoder / np.maximum(p_h[None, :], eps))[valid_xh]
-    )
-    i_hx = float(ix_terms.sum())
-
-    # I(H;Y) = sum_h,y p(h,y) log[p(h,y)/(p(h)p(y))]
-    denominator = p_h[:, None] * p_y[None, :]
-    valid_hy = p_hy > 0
-    iy_terms = np.zeros_like(p_hy)
-    iy_terms[valid_hy] = p_hy[valid_hy] * np.log(
-        (p_hy / np.maximum(denominator, eps))[valid_hy]
-    )
-    i_hy = float(iy_terms.sum())
-
-    return {"I_HX": i_hx, "I_HY": i_hy}
+# Examples
 
 def doubling_map(x: np.ndarray) -> np.ndarray:
     """One step of x -> 2x mod 1 on [0, 1)."""
@@ -379,7 +492,7 @@ def compare_ulam_with_exact(
     return estimate, fig
 
 def test_ib_on_four_bin_doubling_map(
-    beta: float = 1.000001,
+    beta: float = 100,
     n_seeds: int = 20,
 ) -> tuple[np.ndarray, dict[str, float], go.Figure]:
     """Test predictive IB on the exact four-bin doubling-map transition matrix."""
@@ -397,7 +510,7 @@ def test_ib_on_four_bin_doubling_map(
     best_info = None
 
     for seed in range(n_seeds):
-        encoder, info = predictive_information_bottleneck(
+        encoder, info = blahut_arimoto(
             transition=transition,
             stationary=stationary,
             n_reduced_states=2,
@@ -407,8 +520,6 @@ def test_ib_on_four_bin_doubling_map(
         if best_info is None or info["objective"] < best_info["objective"]:
             best_encoder = encoder
             best_info = info
-            best_info["I_HX"] /= np.log(2)
-            best_info["I_HY"] /= np.log(2)
 
     assert best_encoder is not None and best_info is not None
 
@@ -518,6 +629,6 @@ if __name__ == "__main__":
     # --- TEST IB --- # 
     encoder, info, figure = test_ib_on_four_bin_doubling_map()
 
-    print("Learned encoder q(h|x):\n", np.round(encoder, 3))
+    print("Learned encoder p(h|x):\n", np.round(encoder, 3))
     print("Information values:", info)
     figure.show()
