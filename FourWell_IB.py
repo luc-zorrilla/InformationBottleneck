@@ -130,7 +130,7 @@ def plot_results(
 
 def main() -> None:
     base_params = {
-        "A": 10,
+        "A": 5,
         "a": 0.5,
         "b": 1.0,
     }
@@ -146,7 +146,7 @@ def main() -> None:
     burn_in_steps = n_steps//10
     beta = 1e6
     n_states_to_test = range(1,10)
-    sigma_values = np.linspace(0.05, 0.4, 8)
+    sigma_values = np.linspace(0.1, 0.4, 4)
 
     bin_edges = np.linspace(-1, 1, 1000)
     n_h_values = list(n_states_to_test)
@@ -288,6 +288,10 @@ def main() -> None:
             results[n_h]["I_HX"]
             for n_h in n_h_values
         ]
+        # i_h = [
+        #     results[n_h]["H_H"]
+        #     for n_h in n_h_values
+        # ]
 
         # Show a colorbar on the predictive-information subplot.
         # Only one trace needs to display it.
